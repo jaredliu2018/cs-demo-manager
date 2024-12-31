@@ -1,5 +1,6 @@
 #include <thread>
 #include <fstream>
+#include <mutex>
 #include <deque>
 #include <nlohmann/json.hpp>
 #include <easywsclient.hpp>
@@ -7,10 +8,12 @@
 #include "cdll_interfaces.h"
 #ifdef _WIN32
 #define SERVER_LIB_PATH "\\csgo\\bin\\win64\\server.dll"
+#define CLIENT_LIB_PATH "\\csgo\\bin\\win64\\client.dll"
 #else
 #include <dlfcn.h>
 #include <sys/mman.h>
 #define SERVER_LIB_PATH "/csgo/bin/linuxsteamrt64/libserver.so"
+#define CLIENT_LIB_PATH "/csgo/bin/linuxsteamrt64/libclient.so"
 #define PAGESIZE 4096
 #endif
 
@@ -33,9 +36,9 @@ void* GetLibAddress(void* lib, const char* name) {
 
 char* GetLastErrorString() {
 #ifdef _WIN32
-    DWORD error = GetLastError();
-    static char s[_MAX_U64TOSTR_BASE2_COUNT];
-    sprintf(s, "%lu", error);
+	DWORD error = GetLastError();
+	static char s[_MAX_U64TOSTR_BASE2_COUNT];
+	sprintf(s, "%lu", error);
 
 	return s;
 #else
@@ -45,28 +48,34 @@ char* GetLastErrorString() {
 
 void* LoadLib(const char* path) {
 #ifdef _WIN32
-    return LoadLibrary(path);
+	return LoadLibrary(path);
 #else
 	return dlopen(path, RTLD_NOW);
 #endif
 }
 
 struct Action {
-    int tick;
-    string cmd;
+	int tick;
+	string cmd;
 };
 
 typedef bool (*AppSystemConnectFn)(IAppSystem* appSystem, CreateInterfaceFn factory);
 typedef void (*AppSystemShutdownFn)();
+#ifdef _WIN32
+typedef void(__stdcall* FrameStageNotifyFn) (void*, ClientFrameStage_t);
+#else
+typedef void (*FrameStageNotifyFn)(void*, ClientFrameStage_t);
+#endif
 
 CreateInterfaceFn factory = NULL;
 AppSystemConnectFn serverConfigConnect = NULL;
 AppSystemShutdownFn serverConfigShutdown = NULL;
+FrameStageNotifyFn originalFrameStageNotify = NULL;
 CreateInterfaceFn serverCreateInterface = NULL;
+CreateInterfaceFn clientCreateInterface = NULL;
 ISource2EngineToClient* engineToClient = NULL;
 ICvar* g_pCVar = NULL;
 std::thread* wsConnectionThread = NULL;
-std::thread* demoPlaybackThread = NULL;
 WebSocket::pointer ws;
 string gameInfoPath;
 string gameInfoBackupPath;
@@ -76,19 +85,21 @@ int currentTick = -1;
 bool isQuitting = false;
 bool initialized = false;
 std::vector<Action> actions = {};
+std::string pendingCmd;
+std::mutex pendingCmdMutex;
 
 void LogToFile(const char* pMsg) {
-    FILE* pFile = fopen("csdm.log", "a");
-    if (pFile == NULL)
-    {
-        return;
-    }
+	FILE* pFile = fopen("csdm.log", "a");
+	if (pFile == NULL)
+	{
+		return;
+	}
 
-    fprintf(pFile, "%s\n", pMsg);
-    fclose(pFile);
+	fprintf(pFile, "%s\n", pMsg);
+	fclose(pFile);
 }
 
-void Log(const char *msg, ...)
+void Log(const char* msg, ...)
 {
 	va_list args;
 	va_start(args, msg);
@@ -96,325 +107,392 @@ void Log(const char *msg, ...)
 	vsnprintf(buf, sizeof(buf), msg, args);
 	ConColorMsg(Color(227, 0, 255, 255), "CSDM: %s\n", buf);
 	va_end(args);
+	LogToFile(buf);
 }
 
 void PluginError(const char* msg, ...)
 {
-    va_list args;
-    va_start(args, msg);
-    char buf[1024] = {};
-    vsnprintf(buf, sizeof(buf), msg, args);
-    va_end(args);
+	va_list args;
+	va_start(args, msg);
+	char buf[1024] = {};
+	vsnprintf(buf, sizeof(buf), msg, args);
+	va_end(args);
 
-    // Since the "Armory" update, calling Plat_FatalErrorFunc crashes the game on Windows.
-    #ifdef _WIN32
-        Plat_MessageBox("Error", buf);
-        Plat_ExitProcess(1);
-    #else
-        Plat_FatalErrorFunc("%s", buf);
-    #endif
+	// Since the "Armory" update, calling Plat_FatalErrorFunc crashes the game on Windows.
+#ifdef _WIN32
+	Plat_MessageBox("Error", buf);
+	Plat_ExitProcess(1);
+#else
+	Plat_FatalErrorFunc("%s", buf);
+#endif
 }
 
 inline bool FileExists(const std::string& name) {
-    std::ifstream f(name.c_str());
+	std::ifstream f(name.c_str());
 
-    return f.good();
+	return f.good();
 }
 
 // Thank you Saul! https://github.com/saul/cvar-unhide-s2
 static void UnhideCommandsAndCvars()
 {
-    uint64 flagsToRemove = (FCVAR_HIDDEN | FCVAR_DEVELOPMENTONLY | FCVAR_MISSING3);
+	uint64 flagsToRemove = (FCVAR_HIDDEN | FCVAR_DEVELOPMENTONLY | FCVAR_MISSING3);
 
-    ConCommandHandle cmdHandle{};
-    auto invalidConcmd = g_pCVar->GetCommand(cmdHandle);
-    int cmdIdx = 0;
-    for (;;)
-    {
-        cmdHandle.Set(cmdIdx++);
-        auto concmd = g_pCVar->GetCommand(cmdHandle);
-        if (concmd == invalidConcmd)
-            break;
+	ConCommandHandle cmdHandle{};
+	auto invalidConcmd = g_pCVar->GetCommand(cmdHandle);
+	int cmdIdx = 0;
+	for (;;)
+	{
+		cmdHandle.Set(cmdIdx++);
+		auto concmd = g_pCVar->GetCommand(cmdHandle);
+		if (concmd == invalidConcmd)
+			break;
 
-        if (concmd->GetFlags() & flagsToRemove)
-        {
-            concmd->RemoveFlags(flagsToRemove);
-        }
-    }
+		if (concmd->GetFlags() & flagsToRemove)
+		{
+			concmd->RemoveFlags(flagsToRemove);
+		}
+	}
 
-    ConVarHandle cvarHandle{};
-    auto invalidCvar = g_pCVar->GetConVar(cvarHandle);
-    int cvarIdx = 0;
-    for (;;)
-    {
-        cvarHandle.Set(cvarIdx++);
-        auto convar = g_pCVar->GetConVar(cvarHandle);
-        if (convar == invalidCvar)
-            break;
+	ConVarHandle cvarHandle{};
+	auto invalidCvar = g_pCVar->GetConVar(cvarHandle);
+	int cvarIdx = 0;
+	for (;;)
+	{
+		cvarHandle.Set(cvarIdx++);
+		auto convar = g_pCVar->GetConVar(cvarHandle);
+		if (convar == invalidCvar)
+			break;
 
-        if (convar->flags & flagsToRemove)
-        {
-            convar->flags &= ~flagsToRemove;
-        }
-    }
+		if (convar->flags & flagsToRemove)
+		{
+			convar->flags &= ~flagsToRemove;
+		}
+	}
 }
 
 ISource2EngineToClient* GetEngine()
 {
-    if (engineToClient != NULL) {
-        return engineToClient;
-    }
+	if (engineToClient != NULL) {
+		return engineToClient;
+	}
 
-    if (factory == NULL) {
-        return NULL;
-    }
+	if (factory == NULL) {
+		return NULL;
+	}
 
-    engineToClient = (ISource2EngineToClient*)factory("Source2EngineToClient001", NULL);
+	engineToClient = (ISource2EngineToClient*)factory("Source2EngineToClient001", NULL);
 
-    return engineToClient;
+	return engineToClient;
 }
 
 void SendStatusOk() {
-    json msg;
-    msg["name"] = "status";
-    msg["payload"] = "ok";
-    ws->send(msg.dump());
+	json msg;
+	msg["name"] = "status";
+	msg["payload"] = "ok";
+	ws->send(msg.dump());
 }
 
 void RestoreGameinfoFile() {
-    std::ifstream filebackupFile(gameInfoBackupPath);
-    if (!filebackupFile.good()) {
-        Log("gameinfo.gi backup file doesn't exist");
-        filebackupFile.close();
-        return;
-    }
+	std::ifstream filebackupFile(gameInfoBackupPath);
+	if (!filebackupFile.good()) {
+		Log("gameinfo.gi backup file doesn't exist");
+		filebackupFile.close();
+		return;
+	}
 
-    std::ofstream destination(gameInfoPath);
-    destination << filebackupFile.rdbuf();
+	std::ofstream destination(gameInfoPath);
+	destination << filebackupFile.rdbuf();
 
-    filebackupFile.close();
-    destination.close();
+	filebackupFile.close();
+	destination.close();
 
-    int result = remove(gameInfoBackupPath.c_str());
-    if (result == 0) {
-        Log("Backup file deleted successfully");
-    }
-    else
-    {
-        Log("Error deleting backup file");
-    }
+	int result = remove(gameInfoBackupPath.c_str());
+	if (result == 0) {
+		Log("Backup file deleted successfully");
+	}
+	else
+	{
+		Log("Error deleting backup file");
+	}
 }
 
 void LoadJsonActionsFile(string demoPath) {
-    actions.clear();
-    string demoJsonPath = demoPath + ".json";
-    if (FileExists(demoJsonPath)) {
-        std::ifstream jsonFile(demoJsonPath);
-        json jsonActions = json::parse(jsonFile);
-        if (jsonActions.size() == 0) {
-            Log("No actions found in JSON file");
-            return;
-        }
+	actions.clear();
+	string demoJsonPath = demoPath + ".json";
+	if (FileExists(demoJsonPath)) {
+		std::ifstream jsonFile(demoJsonPath);
+		json jsonActions = json::parse(jsonFile);
+		if (jsonActions.size() == 0) {
+			Log("No actions found in JSON file");
+			return;
+		}
 
-        for (auto jsonAction : jsonActions) {
-            struct Action action;
-            int tick = jsonAction["tick"];
-            action.tick = tick;
-            action.cmd = jsonAction["cmd"];
-            actions.push_back(action);
-        }
+		for (auto jsonAction : jsonActions) {
+			struct Action action;
+			int tick = jsonAction["tick"];
+			action.tick = tick;
+			action.cmd = jsonAction["cmd"];
+			actions.push_back(action);
+		}
 
-        Log("JSON file actions loaded: %s", demoJsonPath.c_str());
-        Log("Actions: %s", jsonActions.dump().c_str());
-    }
-    else {
-        Log("JSON file actions not found at %s", demoJsonPath.c_str());
-    }
+		Log("JSON file actions loaded: %s", demoJsonPath.c_str());
+		Log("Actions: %s", jsonActions.dump().c_str());
+	}
+	else {
+		Log("JSON file actions not found at %s", demoJsonPath.c_str());
+	}
 }
 
-void PlaybackLoop() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+void ExecutePendingCommand()
+{
+	if (pendingCmdMutex.try_lock())
+	{
+		if (!pendingCmd.empty())
+		{
+			Log("Executing command: %s", pendingCmd.c_str());
+			auto engine = GetEngine();
+			engine->ExecuteClientCmd(0, pendingCmd.c_str(), true);
+			pendingCmd.clear();
+		}
+		pendingCmdMutex.unlock();
+	}
+	else
+	{
+		Log("Mutex locked, deferring command execution to next frame.");
+	}
+}
 
-    while (true) {
-        if (isQuitting) {
-            break;
-        }
+void PlaybackFrame() {
+	if (isQuitting) {
+		return;
+	}
 
-        auto engine = GetEngine();
-        if (engine == NULL) {
-            continue;
-        }
+	auto engine = GetEngine();
+	if (engine == NULL) {
+		return;
+	}
 
-        if (!initialized) {
-            // Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
-			// We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
-            engine->ExecuteClientCmd(0, "demo_ui_mode 0", true);
-            initialized = true;
-        }
+	if (!initialized) {
+		// Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
+		// We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
+		engine->ExecuteClientCmd(0, "demo_ui_mode 0", true);
+		initialized = true;
+	}
 
-        bool newIsPlayingDemo = engine->IsPlayingDemo();
-        if (newIsPlayingDemo && !isPlayingDemo) {
-            Log("Demo playback started %d", currentTick);
-            currentTick = -1;
+	bool newIsPlayingDemo = engine->IsPlayingDemo();
+	if (newIsPlayingDemo && !isPlayingDemo) {
+		Log("Demo playback started %d", currentTick);
+		currentTick = -1;
 
-            // Required to make the spec_lock_to_accountid command working since the 25/04/2024 update - it looks like the command has been hidden.
-            // Also required to use the startmovie command.
-            UnhideCommandsAndCvars();
-        }
-        else if (!newIsPlayingDemo && isPlayingDemo) {
-            Log("Demo playback stopped %d", currentTick);
-            currentTick = -1;
-        }
+		// Required to make the spec_lock_to_accountid command working since the 25/04/2024 update - it looks like the command has been hidden.
+		// Also required to use the startmovie command.
+		UnhideCommandsAndCvars();
+	}
+	else if (!newIsPlayingDemo && isPlayingDemo) {
+		Log("Demo playback stopped %d", currentTick);
+		currentTick = -1;
+	}
 
-        isPlayingDemo = newIsPlayingDemo;
-        if (!isPlayingDemo) {
-            continue;
-        }
+	isPlayingDemo = newIsPlayingDemo;
+	if (!isPlayingDemo) {
+		return;
+	}
 
-        auto demo = engine->GetDemoFile();
-        if (demo == NULL) {
-            continue;
-        }
+	auto demo = engine->GetDemoFile();
+	if (demo == NULL) {
+		return;
+	}
 
-        int newTick = demo->GetDemoTick();
-        if (newTick != currentTick) {
-            // Log("Tick: %d", newTick);
+	int newTick = demo->GetDemoTick();
+	if (newTick != currentTick) {
+		for (auto action : actions) {
+			if (action.tick == newTick) {
+				Log("Tick: %d", newTick);
+				Log("Executing: %s", action.cmd.c_str());
+				engine->ExecuteClientCmd(0, action.cmd.c_str(), true);
+			}
+		}
+	}
 
-            for (auto action : actions) {
-                if (action.tick == newTick) {
-                    if (action.cmd == "pause_playback")
-                    {
-                        Log("Pausing demo playback");
-                        engine->ExecuteClientCmd(0, "demo_pause", true);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        Log("Resuming demo playback");
-                        engine->ExecuteClientCmd(0, "demo_resume", true);
-                    } else
-                    {
-                        Log("Executing: %s", action.cmd.c_str());
-                        engine->ExecuteClientCmd(0, action.cmd.c_str(), true);
-                    }
-                }
-            }
-        }
-
-        currentTick = newTick;
-    }
+	currentTick = newTick;
 }
 
 void HandleWebSocketMessage(const std::string& message)
 {
-    Log("Message received: %s", message.c_str());
+	Log("Message received: %s", message.c_str());
 
-    json msg = json::parse(message.c_str());
-    if (!msg.contains("name")) {
-        return;
-    }
+	json msg = json::parse(message.c_str());
+	if (!msg.contains("name")) {
+		return;
+	}
 
-    if (msg["name"] == "playdemo" && msg.contains("payload") && msg["payload"].is_string()) {
-        SendStatusOk();
+	if (msg["name"] == "playdemo" && msg.contains("payload") && msg["payload"].is_string()) {
+		SendStatusOk();
 
-        string demoPath = msg["payload"];
+		string demoPath = msg["payload"];
 
-        LoadJsonActionsFile(demoPath);
+		LoadJsonActionsFile(demoPath);
 
-        string cmd = "playdemo \"" + demoPath + "\"";
-        Log("Starting demo: %s", cmd.c_str());
-        auto engine = GetEngine();
-        engine->ExecuteClientCmd(0, cmd.c_str(), true);
-    }
+		std::lock_guard<std::mutex> lock(pendingCmdMutex);
+		pendingCmd = "playdemo \"" + demoPath + "\"";
+	}
 }
 
 void ConnectToWebsocketServer() {
-    Log("Connecting to WebSocket server...");
-    ws = WebSocket::from_url("ws://localhost:4574?process=game");
-    if (ws == NULL)
-    {
-        Log("Failed to connect to WebSocket server.");
-        return;
-    }
-    
-    Log("Connected to WebSocket server.");
-    while (ws->getReadyState() != WebSocket::CLOSED && !isQuitting) {
-        ws->poll();
-        ws->dispatch(HandleWebSocketMessage);
-    }
+	Log("Connecting to WebSocket server...");
+	ws = WebSocket::from_url("ws://localhost:4574?process=game");
+	if (ws == NULL)
+	{
+		Log("Failed to connect to WebSocket server.");
+		return;
+	}
 
-    Log("Disconnected from WebSocket server.");
-    delete ws;
-    ws = NULL;
+	Log("Connected to WebSocket server.");
+	while (ws->getReadyState() != WebSocket::CLOSED && !isQuitting) {
+		ws->poll();
+		ws->dispatch(HandleWebSocketMessage);
+	}
+
+	Log("Disconnected from WebSocket server.");
+	delete ws;
+	ws = NULL;
 }
 
 void ConnectToWebsocketServerLoop() {
-    while (true) {
-        if (isQuitting) {
-            break;
-        }
+	while (true) {
+		if (isQuitting) {
+			break;
+		}
 
-        if (ws != NULL) {
-            continue;
-        }
+		if (ws != NULL) {
+			continue;
+		}
 
-        ConnectToWebsocketServer();
+		ConnectToWebsocketServer();
 
-        if (ws == NULL) {
-            Log("Retrying in 2s...");
-            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-        }
-    }
+		if (ws == NULL) {
+			Log("Retrying in 2s...");
+			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+		}
+	}
+}
+
+#ifdef _WIN32
+void __stdcall NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
+#else
+void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
+#endif
+{
+	//Log("NewFrameStageNotify %p %d", thisptr, stage);
+
+	ExecutePendingCommand();
+	PlaybackFrame();
+
+#ifdef _WIN32
+	originalFrameStageNotify(thisptr, stage);
+#else
+	originalFrameStageNotify(thisptr, stage);
+#endif
 }
 
 bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
 {
-    factory = factoryFn;
-    bool result = serverConfigConnect(appSystem, factory);
+	factory = factoryFn;
+	bool result = serverConfigConnect(appSystem, factory);
 
-    g_pCVar = (ICvar*)factory("VEngineCvar007", NULL);
-    #ifdef CON_COMMAND_ENABLED
-        ConVar_Register();
-    #endif
+	g_pCVar = (ICvar*)factory("VEngineCvar007", NULL);
+#ifdef CON_COMMAND_ENABLED
+	ConVar_Register();
+#endif
 
-    wsConnectionThread = new std::thread(ConnectToWebsocketServerLoop);
-    demoPlaybackThread = new std::thread(PlaybackLoop);
+	wsConnectionThread = new std::thread(ConnectToWebsocketServerLoop);
 
-    RestoreGameinfoFile();
+	if (clientCreateInterface == NULL)
+	{
+		const char* gameDirectory = Plat_GetGameDirectory();
+		string libPath = string(gameDirectory) + CLIENT_LIB_PATH;
 
-    return result;
+		void* clientModule = LoadLib(libPath.c_str());
+		if (clientModule == NULL)
+		{
+			PluginError("Could not load server lib %s : %s", libPath.c_str(), GetLastErrorString());
+		}
+
+		clientCreateInterface = (CreateInterfaceFn)GetLibAddress(clientModule, "CreateInterface");
+		if (clientCreateInterface == NULL)
+		{
+			PluginError("Could not find CreateInterface : %s", GetLastErrorString());
+		}
+	}
+
+	int returnCode;
+	void* original = clientCreateInterface("Source2Client002", &returnCode);
+	auto vtable = *(void***)original;
+#if defined _WIN32
+	DWORD oldProtect = 0;
+	if (!VirtualProtect(vtable, sizeof(void**), PAGE_EXECUTE_READWRITE, &oldProtect))
+	{
+		PluginError("VirtualProtect PAGE_EXECUTE_READWRITE failed: %d", GetLastError());
+	}
+
+	originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
+	vtable[36] = &NewFrameStageNotify;
+
+	DWORD ignore = 0;
+	if (!VirtualProtect(vtable, sizeof(void**), oldProtect, &ignore))
+	{
+		PluginError("VirtualProtect restore failed: %d", GetLastError());
+	}
+#else
+	void* pageStart = (void*)((uintptr_t)vtable & ~(PAGESIZE - 1));
+	if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+	{
+		PluginError("mprotect failed: %s", strerror(errno));
+	}
+
+	originalFrameStageNotify = (AppSystemConnectFn)vtable[36];
+	vtable[36] = reinterpret_cast<void*>(&NewFrameStageNotify);
+
+	if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_EXEC) != 0)
+	{
+		PluginError("mprotect restore failed: %s", strerror(errno));
+	}
+#endif
+
+	RestoreGameinfoFile();
+
+	return result;
 }
 
 
 void Shutdown()
 {
-    isQuitting = true;
+	isQuitting = true;
 
-    if (serverConfigShutdown != NULL) {
-        serverConfigShutdown();
-    }
+	if (serverConfigShutdown != NULL) {
+		serverConfigShutdown();
+	}
 
-    #ifdef CON_COMMAND_ENABLED
-        ConVar_Unregister();
-    #endif
+#ifdef CON_COMMAND_ENABLED
+	ConVar_Unregister();
+#endif
 
-    if (ws != NULL) {
-        ws->close();
-    }
+	if (ws != NULL) {
+		ws->close();
+	}
 
-    if (wsConnectionThread != NULL) {
-        wsConnectionThread->join();
-        wsConnectionThread = NULL;
-    }
-
-    if (demoPlaybackThread != NULL) {
-        demoPlaybackThread->join();
-        demoPlaybackThread = NULL;
-    }
+	if (wsConnectionThread != NULL) {
+		wsConnectionThread->join();
+		wsConnectionThread = NULL;
+	}
 }
 
 void AssertInsecureParameterIsPresent()
 {
-    bool found = false;
+	bool found = false;
 	// Since the "Armory" update, calling CommandLine()->HasParm("-insecure") crashes the game when the parameter is not present.
-    auto parameters = CommandLine()->GetParms();
+	auto parameters = CommandLine()->GetParms();
 	for (int i = 0; i < CommandLine()->ParmCount(); i++)
 	{
 		if (strcmp(parameters[i], "-insecure") == 0)
@@ -432,97 +510,97 @@ void AssertInsecureParameterIsPresent()
 
 EXPORT void* CreateInterface(const char* pName, int* pReturnCode)
 {
-    if (serverCreateInterface == NULL)
-    {
-        AssertInsecureParameterIsPresent();
+	if (serverCreateInterface == NULL)
+	{
+		AssertInsecureParameterIsPresent();
 
-        const char* gameDirectory = Plat_GetGameDirectory();
-        gameInfoPath = string(gameDirectory) + "/csgo/gameinfo.gi";
-        gameInfoBackupPath = string(gameDirectory) + "/csgo/gameinfo.gi.backup";
-        string libPath = string(gameDirectory) + SERVER_LIB_PATH;
+		const char* gameDirectory = Plat_GetGameDirectory();
+		gameInfoPath = string(gameDirectory) + "/csgo/gameinfo.gi";
+		gameInfoBackupPath = string(gameDirectory) + "/csgo/gameinfo.gi.backup";
+		string libPath = string(gameDirectory) + SERVER_LIB_PATH;
 
-        void* serverModule = LoadLib(libPath.c_str());
-        if (serverModule == NULL)
-        {
-            PluginError("Could not load server lib %s : %s", libPath.c_str(), GetLastErrorString());
-        }
+		void* serverModule = LoadLib(libPath.c_str());
+		if (serverModule == NULL)
+		{
+			PluginError("Could not load server lib %s : %s", libPath.c_str(), GetLastErrorString());
+		}
 
-        serverCreateInterface = (CreateInterfaceFn)GetLibAddress(serverModule, "CreateInterface");
-        if (serverCreateInterface == NULL)
-        {
-            PluginError("Could not find CreateInterface : %s", GetLastErrorString());
-        }
-    }
+		serverCreateInterface = (CreateInterfaceFn)GetLibAddress(serverModule, "CreateInterface");
+		if (serverCreateInterface == NULL)
+		{
+			PluginError("Could not find CreateInterface : %s", GetLastErrorString());
+		}
+	}
 
-    void* original = serverCreateInterface(pName, pReturnCode);
-    if (strcmp(pName, "Source2ServerConfig001") == 0)
-    {
-        auto vtable = *(void***)original;
+	void* original = serverCreateInterface(pName, pReturnCode);
+	if (strcmp(pName, "Source2ServerConfig001") == 0)
+	{
+		auto vtable = *(void***)original;
 
 #if defined _WIN32
-        DWORD oldProtect = 0;
-        if (!VirtualProtect(vtable, sizeof(void**), PAGE_EXECUTE_READWRITE, &oldProtect))
-        {
-            PluginError("VirtualProtect PAGE_EXECUTE_READWRITE failed: %d", GetLastError());
-        }
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(vtable, sizeof(void**), PAGE_EXECUTE_READWRITE, &oldProtect))
+		{
+			PluginError("VirtualProtect PAGE_EXECUTE_READWRITE failed: %d", GetLastError());
+		}
 
-        serverConfigConnect = (AppSystemConnectFn)vtable[0];
-        serverConfigShutdown = (AppSystemShutdownFn)vtable[1];
-        vtable[0] = &Connect;
-        vtable[1] = &Shutdown;
+		serverConfigConnect = (AppSystemConnectFn)vtable[0];
+		serverConfigShutdown = (AppSystemShutdownFn)vtable[1];
+		vtable[0] = &Connect;
+		vtable[1] = &Shutdown;
 
-        DWORD ignore = 0;
-        if (!VirtualProtect(vtable, sizeof(void**), oldProtect, &ignore))
-        {
-            PluginError("VirtualProtect restore failed: %d", GetLastError());
-        }
+		DWORD ignore = 0;
+		if (!VirtualProtect(vtable, sizeof(void**), oldProtect, &ignore))
+		{
+			PluginError("VirtualProtect restore failed: %d", GetLastError());
+		}
 #else
-        void* pageStart = (void*)((uintptr_t)vtable & ~(PAGESIZE - 1));
-        if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
-        {
-            PluginError("mprotect failed: %s", strerror(errno));
-        }
+		void* pageStart = (void*)((uintptr_t)vtable & ~(PAGESIZE - 1));
+		if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+		{
+			PluginError("mprotect failed: %s", strerror(errno));
+		}
 
-        serverConfigConnect = (AppSystemConnectFn)vtable[0];
-        serverConfigShutdown = (AppSystemShutdownFn)vtable[4];
-        vtable[0] = reinterpret_cast<void*>(&Connect);
-        vtable[4] = reinterpret_cast<void*>(&Shutdown);
+		serverConfigConnect = (AppSystemConnectFn)vtable[0];
+		serverConfigShutdown = (AppSystemShutdownFn)vtable[4];
+		vtable[0] = reinterpret_cast<void*>(&Connect);
+		vtable[4] = reinterpret_cast<void*>(&Shutdown);
 
-        if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_EXEC) != 0)
-        {
-            PluginError("mprotect restore failed: %s", strerror(errno));
-        }
+		if (mprotect(pageStart, PAGESIZE, PROT_READ | PROT_EXEC) != 0)
+		{
+			PluginError("mprotect restore failed: %s", strerror(errno));
+		}
 #endif
-    }
+	}
 
-    if (demoPath == NULL) {
-        int paramCount = CommandLine()->ParmCount();
-        for (int i = 0; i < paramCount; i++) {
-            const char* param = CommandLine()->GetParm(i);
-            if (strcmp(param, "+playdemo") == 0 && i + 1 < paramCount) {
-                demoPath = CommandLine()->GetParm(i + 1);
-                LoadJsonActionsFile(string(demoPath));
-                break;
-            }
-        }
-    }
+	if (demoPath == NULL) {
+		int paramCount = CommandLine()->ParmCount();
+		for (int i = 0; i < paramCount; i++) {
+			const char* param = CommandLine()->GetParm(i);
+			if (strcmp(param, "+playdemo") == 0 && i + 1 < paramCount) {
+				demoPath = CommandLine()->GetParm(i + 1);
+				LoadJsonActionsFile(string(demoPath));
+				break;
+			}
+		}
+	}
 
-    return original;
+	return original;
 }
 
 #ifdef CON_COMMAND_ENABLED
 CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
 {
-    Log("Tick: %d", currentTick);
-    Log("Is playing demo: %d", isPlayingDemo);
+	Log("Tick: %d", currentTick);
+	Log("Is playing demo: %d", isPlayingDemo);
 
-    if (ws != NULL) {
-        Log("WebSocket connected");
-    }
-    else {
-        Log("WebSocket not connected");
-    }
+	if (ws != NULL) {
+		Log("WebSocket connected");
+	}
+	else {
+		Log("WebSocket not connected");
+	}
 
-    Log("Action count: %d", actions.size());
+	Log("Action count: %d", actions.size());
 }
 #endif
